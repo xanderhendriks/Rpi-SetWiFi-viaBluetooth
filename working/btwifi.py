@@ -19,9 +19,6 @@ SEPARATOR = SEPARATOR_HEX.decode()  # string representation can be concatenated 
 NOTIFY_TIMEOUT = 1000  #in ms - used for checking notifications
 BLE_SERVER_GLIB_TIMEOUT = 2500  # used for checking BLE Server timeout
 
-
-# **************************************************************************
-
 class BTDbusSender(dbus.service.Object):
     #only for BT process
     def __init__(self):
@@ -225,24 +222,43 @@ class Blue:
 
     @staticmethod
     def set_adapter():
-        Blue.bus = dbus.SystemBus()
-        obj = Blue.bus.get_object('org.bluez','/')
-        obj_interface=dbus.Interface(obj,'org.freedesktop.DBus.ObjectManager')
-        all = obj_interface.GetManagedObjects()
-        for item in all.items(): #this gives a list of all bluez objects
-            # Log.log(f"BlueZ Adapter name: {item[0]}")
-            # Log.log(f"BlueZ Adapter data: {item[1]}\n")
-            # Log.log("******************************\n")
-            if  (item[0] == '/org/bluez/hci0') or ('org.bluez.LEAdvertisingManager1' in item[1].keys() and 'org.bluez.GattManager1' in item[1].keys() ):
-                #this the bluez adapter1 object that we need
-                # Log.log(f"Found BlueZ Adapter name: {item[0]}\n")
-                
-                Blue.adapter_name = item[0]
-                Blue.adapter_obj = Blue.bus.get_object('org.bluez',Blue.adapter_name)
-                #turn_on the adapter - to make sure (on rpi it may already be turned on)
-                props = dbus.Interface(Blue.adapter_obj,'org.freedesktop.DBus.Properties')
-                props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(1))
-                break
+        try:
+            found_flag = False
+            Blue.bus = dbus.SystemBus()
+            obj = Blue.bus.get_object('org.bluez','/')
+            obj_interface=dbus.Interface(obj,'org.freedesktop.DBus.ObjectManager')
+            all = obj_interface.GetManagedObjects()
+            for item in all.items(): #this gives a list of all bluez objects
+                # Log.log(f"BlueZ Adapter name: {item[0]}")
+                # Log.log(f"BlueZ Adapter data: {item[1]}\n")
+                # Log.log("******************************\n")
+                if  (item[0] == '/org/bluez/hci0') or ('org.bluez.LEAdvertisingManager1' in item[1].keys() and 'org.bluez.GattManager1' in item[1].keys() ):
+                    #this the bluez adapter1 object that we need
+                    # Log.log(f"Found BlueZ Adapter name: {item[0]}\n")
+                    found_flag = True
+                    Blue.adapter_name = item[0]
+                    Blue.adapter_obj = Blue.bus.get_object('org.bluez',Blue.adapter_name)
+                    #turn_on the adapter - to make sure (on rpi it may already be turned on)
+                    props = dbus.Interface(Blue.adapter_obj,'org.freedesktop.DBus.Properties')
+
+                    props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(1))
+                    props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(0))
+                    props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
+                    props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(1))
+                    props.Set("org.bluez.Adapter1", "DiscoverableTimeout", dbus.UInt32(0))
+
+                    break
+            if not found_flag:
+                Log.log("No suitable Bluetooth adapter found")
+                #raise Exception("No suitable Bluetooth adapter found")
+            
+        except dbus.exceptions.DBusException as e:
+            Log.log(f"DBus error in set_adapter: {str(e)}")
+            raise
+        except Exception as e:
+            Log.log(f"Error in set_adapter: {str(e)}")
+            raise
+
 
     @staticmethod
     def adv_mgr(): 
@@ -288,11 +304,16 @@ class Advertise(dbus.service.Object):
 
     def __init__(self, index,bleMgr):
         self.bleMgr = bleMgr
+        self.hostname = wifi.WifiUtil.get_hostname()
         self.properties = dict()
         self.properties["Type"] = dbus.String("peripheral")
         self.properties["ServiceUUIDs"] = dbus.Array([UUID_WIFISET],signature='s')
         self.properties["IncludeTxPower"] = dbus.Boolean(True)
-        self.properties["LocalName"] = dbus.String("Wifiset")
+        self.properties["LocalName"] = dbus.String(self.hostname)
+        self.properties["Flags"] = dbus.Byte(0x06) 
+
+        #flags: 0x02: "LE General Discoverable Mode"
+        #       0x04: "BR/EDR Not Supported"
         self.path = "/org/bluez/advertise" + str(index)
         dbus.service.Object.__init__(self, Blue.bus, self.path)
         self.ad_manager = Blue.adv_mgr() 
@@ -443,7 +464,8 @@ class Service(dbus.service.Object):
                         'Primary': self.primary,
                         'Characteristics': dbus.Array(
                                 self.get_characteristic_paths(),
-                                signature='o')
+                                signature='o'),
+                        'Secure': dbus.Array([], signature='s')  # Empty array means no security required
                 }
         }
 
@@ -493,7 +515,10 @@ class Characteristic(dbus.service.Object):
                         'Flags': self.flags,
                         'Descriptors': dbus.Array(
                                 self.get_descriptor_paths(),
-                                signature='o')
+                                signature='o'),
+                        'RequireAuthentication': dbus.Boolean(False),
+                        'RequireAuthorization': dbus.Boolean(False),
+                        'RequireEncryption': dbus.Boolean(False),
                 }
         }
 
@@ -560,6 +585,7 @@ class Descriptor(dbus.service.Object):
                         'Characteristic': self.chrc.get_path(),
                         'UUID': self.uuid,
                         'Flags': self.flags,
+                        'Secure': dbus.Array([], signature='s') 
                 }
         }
 
@@ -655,7 +681,7 @@ class WifiSetService(Service):
             - commands: val[0] must be blank string. then val[1] contains the command
                 -note: command can be json string (user defined buttons)
             - connection_request: val[0] must not be blank and is the requested SSID
-                                  val[1] is the password - which can be left blank
+                                  val[1] is the password - which can be left blank (or = NONE if open SSID)
         Notifications to ios are one of three 
             (all notifications will be pre-pended by SEPARATOR in notification callback "info_wifi_callback"  below as means 
              to differentiate notification from AP info read by ios)
@@ -705,6 +731,11 @@ class WifiSetService(Service):
                 # ap_connected = self.mgr.wpa.connected_AP
                 # if ap_connected != "0000":
                 #     self.notifications.setNotification(ap_connected)
+            elif val[1].startswith("DEL-"):
+                # ssid comes after the first four characters
+                ssid_to_delete = val[1][4:]
+                self.mgr.request_deletion(ssid_to_delete)
+                self.notifications.setNotification('DELETED',"wifi")
                 
             
             #*********** LOCK Management:
@@ -889,7 +920,7 @@ class WifiDataCharacteristic(Characteristic):
             therefore after msg is sent whit encryption, only then is crypto disabled on the pi.
         '''
         if self.notifying:
-            if len(self.service.notifications.notifications)>0:
+            while len(self.service.notifications.notifications)>0:
                 thisNotification_bytes = self.service.notifications.notifications.pop(0)
                 #notification is in bytes, already has prefix separator and may be encrypted
                 needToUnlock = thisNotification_bytes == self.service.notifications.unlockingMsg
@@ -899,7 +930,8 @@ class WifiDataCharacteristic(Characteristic):
                 self.PropertiesChanged("org.bluez.GattCharacteristic1", {"Value": value}, [])
                 Log.log('notification sent')
                 if needToUnlock:
-                    self.service.cryptomgr.disableCrypto() 
+                    self.service.cryptomgr.disableCrypto()
+                    break 
                 
         return self.notifying
 
@@ -937,7 +969,7 @@ class WifiDataCharacteristic(Characteristic):
         messages are either:
              - SEP + command (for controling wifi on pi or asking for AP list)
              - ssid only (no SEP)
-             - ssid + SEP  (no paswword) : note: I dont think this occurs anymore
+             - ssid + SEP + NONE : indicates an open network that does not need a password
              - ssid + SEP + password + SEP + code    code = CP: call change_password; =AD: call add_network
         returns [first_string,second_string]
         everything that arrives before SEP goes into first_string
@@ -961,7 +993,7 @@ class WifiDataCharacteristic(Characteristic):
         #         received[index]+=str(val)
         #case where only ssid has arrived (no password because known network)
         if len(received) == 1 :
-            received.append("")
+            received.append("") #ensure at least two elements in received
         Log.log(f'from iphone received SSID/PW: {received}')
         ConfigData.reset_timeout()  # any data received from iphone resets the BLE Server timeout
         self.service.register_SSID(received)
@@ -1009,6 +1041,7 @@ class BLEManager:
         except Exception as ex:
             Log.log(ex)
         self.mainloop.quit()
+
 
     def graceful_quit(self,signum,frame):
         Log.log("stopping main loop on SIGTERM received")

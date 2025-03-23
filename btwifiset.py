@@ -1,5 +1,8 @@
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import padding
 from cryptography import exceptions as crypto_exceptions
 from datetime import datetime
 from gi.repository import GLib
@@ -172,6 +175,13 @@ class WifiUtil:
             pass
         return found_ssids
 
+
+    @staticmethod
+    def get_hostname():
+        result = subprocess.run("hostname", 
+                                shell=True,capture_output=True,encoding='utf-8',text=True)
+        return result.stdout
+
     @staticmethod
     def get_ip_address():
         #returns dictionary 
@@ -242,7 +252,7 @@ class WifiUtil:
             return None
         else:
             try :
-                return {"other":str(WifiUtil.otherInfo())}
+                return {"other":str(oth)}
             except:
                 return None
 
@@ -250,8 +260,28 @@ class WifiUtil:
     @staticmethod
     def otherInfo():
         #1. remove this line:
-        info = None
+        #info = None
+        info = subprocess.run("free", 
+                shell=True,capture_output=True,encoding='utf-8',text=True).stdout
+        if (info):
+            try:
+                lines = info.strip().split('\n')
+                headers = lines[0].split()
+                mem_values = lines[1].split()
+                info = "Memory     total          Used\n"
+                info += f"                {mem_values[1]}     {mem_values[2]}\n\n"
+            except:
+                info = ""
+        else:
+            info = ""
 
+        try:
+            info += subprocess.run("vcgencmd measure_temp", 
+                shell=True,capture_output=True,encoding='utf-8',text=True).stdout
+        except:
+            info += ""
+            
+        #print(f"OtherInfo\n{info}")
         # 2. add code that generate a string representing the info you want
         #IMPORTANT: you must return a string (not an object!)
         """
@@ -303,6 +333,7 @@ class Wpa_Network:
         self.disabled = disabled
         self.number=number  #not use in network manager version
         self.network_name = network_name if (network_name != "") else ssid
+        #print(self.network_name, ssid)
         '''
         for Network Manager implementations, the name given to the network may not be exactly the same as the ssid exposed by the router.
         In some cases,  Network manager may add a number for example.
@@ -384,6 +415,7 @@ class WPAConf:
     
     def get_wpa_supplicant_ssids(self):
         #use for wpa_supplicant implementation only
+        #(Network Manager uses: get_NM_Known_networks/  mcli_known_networks)
         """
         This gets the list of SSID already in the wpa_supplicant.conf.
         ssids - returns list of tupples ( SSID name , psk= or key_mgmt=NONE)
@@ -427,6 +459,11 @@ class WPAConf:
         ssids = re.findall('(\d+)\s+([^\s]+)', out, re.DOTALL)  #\s+([^\s]+)
         #ssids is returned as: [('0', 'BELL671'), ('1', 'nksan')] - network number, ssid
         #no need to read network numbers as they are incremented started at 0
+        #IMPORTANT:
+        #   there could be more than one SSID of the same name in the conf file.
+        #   this implementation keeps the last entry and its network number
+        #   users of Mesh networks were complaining that two many entries were displayed with the  same name
+        #TODO: further testing with mesh network to ensure that keeping only the last entry works OK.
         mLOG.log(f'Networks configured in wpa_supplicant.conf: {ssids}')
         try: 
             for num, listed_ssid in ssids:
@@ -510,7 +547,7 @@ class WPAConf:
 
     def get_network_name(self,ssid):
         '''
-        pass in networks as a list of Wpa_Network , and ssid as siid published by router
+        ssid published by router
         return array of network names (used by Network Manager) for that ssid if it exists in the list networks
         return None if it does not
         normally there should only be one...
@@ -578,6 +615,7 @@ class NetworkManager:
         ssidList = []
         out = subprocess.run("nmcli dev wifi rescan", 
                             shell=True,capture_output=True,encoding='utf-8',text=True).stdout
+        mLOG.log(f'rescan {out}')
         time.sleep(1)
         out = subprocess.run(
             "nmcli -f SIGNAL,SECURITY,SSID dev wifi list",
@@ -599,7 +637,26 @@ class NetworkManager:
                 found_ssids.append({'ssid':trimmedSSID, 'signal':signal_strength, 'encrypt':'WPA' in encryption})
         return found_ssids
     
+    def request_deletion(self,ssid):
+        """delete the network from network manager.
+        use with care: once done, password that was stored with the network is gone
+        User will need to enter password to connect again
+        """
+        #get the network name corresponding to the ssid (there could be more than one)
+        network_names = self.mgr.wpa.get_network_name(ssid)
+        if network_names is not None:
+            for network_name in network_names:
+                p = subprocess.Popen(["nmcli","connection","delete",f"{network_name}"])
+                p.wait()
+                p.terminate()
+        #IMPORTANT:
+        #at this point, the netwrok still exists in the list of known networks wpa_supplicant_ssids
+        # it is the responsibility of the phone app to call (AP2s) to get the list updated.
+        
     
+
+
+
     def request_connection(self,ssid,pw):
         """  notes on pw:
             - blank:  connecting to known network: just call "up"
@@ -798,7 +855,7 @@ class NetworkManager:
 
     def remove_known_network(self,known_network):
         '''
-            this removes a known network from the device, and moves it from known_network unknown network in list of AP
+            this removes a known network from the device, and moves it from known_network to unknown network in list of AP
         '''
         #check if network to remove is hidden:
 
@@ -863,6 +920,27 @@ class WpaSupplicant:
                     signal_strength = 0
                 found_ssids.append({'ssid':ssid, 'signal':signal_strength, 'encrypt':'WPA' in encryption})
         return found_ssids
+
+    def request_deletion(self,ssid): 
+        """
+            delete the network from network manager.
+            use with care: once done, password that was stored with the network is gone
+            User will need to enter password to connect again
+        """
+        # get the network
+    
+        try:
+             network_to_delete = self.mgr.wpa.wpa_supplicant_ssids[ssid]
+             self.remove_known_network(network_to_delete)
+        except KeyError:
+            # fails silently - no delete action is taken
+            pass
+        #IMPORTANT:
+        #at this point, the netwrok still exists in the list of known networks wpa_supplicant_ssids
+        # it is the responsibility of the phone app to call (AP2s) to get the list updated.
+        #ALSO:  if SSID appears more than oncein the conf file, 
+        #       only the last SSID (ast network number) will have been deleted
+
     
     def request_connection(self,ssid,pw):
         ssid_in_AP,ssid_in_wpa = self.mgr.where_is_ssid(ssid)
@@ -1121,7 +1199,7 @@ class WpaSupplicant:
         out = subprocess.run(f'wpa_cli -i wlan0 get_network {known_network.number} scan_ssid', 
                                 shell=True,capture_output=True,encoding='utf-8',text=True).stdout
         is_hidden = (f'{out}' == "1")
-        #this network is a hidden ssid - it will be removed (not added) from ap list as well
+        #this network is a hidden ssid - it will be removed (or will not added) from ap list 
         mLOG.log(f'out={out}| {known_network.ssid} to be removed is hidden?: {is_hidden}')
             
         #remove the network from Network Manager list of Connections on device
@@ -1227,11 +1305,14 @@ class WifiManager:
                 if known_network is not None:
                     # for Network manager implementation key is network NAME which may be different than ssid
                     # for wp_supplicant - calling this always return the same as the ssid
+                    #test for conflict: whereby the listed in network (in Network mgr or wpa conf file) is locked
+                    #       and live network is showing unlocked (or vice-versa)
                     if known_network.locked != ap.locked:
-                        #TODO:  remove network from known network and make sure it shows as new network
+                        #conflict exists - remove network from Netwrok manager or wpa conf file 
                         mLOG.log(f'info: {ap.ssid}: wpa locked:{known_network.locked} ap locked:{ap.locked}')
                         mLOG.log(f'known network {ap.ssid} in conflict - delete and move to unknown networks')
                         was_hidden = self.operations.remove_known_network(known_network)
+                        #note: in_supplicant was set False above - so network automatically listed as unknown
                     else :
                         ap.in_supplicant = True
                 #normally was_hidden is left to be false and network (known or not) is added to list_of_Aps
@@ -1243,6 +1324,10 @@ class WifiManager:
             except Exception as e:
                 mLOG.log(f'ERROR: {e}')
         return self.list_of_APs
+
+    def request_deletion(self,ssid):
+         #CALLED from Service
+         return self.operations.request_deletion(ssid)
 
     def request_connection(self,ssid,pw):
         #CALLED from Service
@@ -1353,6 +1438,7 @@ class NonceCounter:
         self.num_nonce = last_nonce+2  #num_nonce is the RPi message counter
         self.looped = False
         self.last_received_dict = {}  #key is iphone identifier, value is last received 8 bytes message counter from iphone Nonce
+        self._useAES = False #assume using chacha as default
 
     def removeIdentifier(self,x_in_bytes):
         identifier_bytes = x_in_bytes[8:]
@@ -1384,7 +1470,7 @@ class NonceCounter:
                     mLOG.log(f"stale nonce: last received = {self.last_received_dict[identifier_str]} - ignoring message")
                     return False
                 else:
-                    mLOG.log(f"uodating last received to {message_counter}")
+                    mLOG.log(f"updating last received to {message_counter}")
                     self.last_received_dict[identifier_str] = message_counter
                     return True
         except Exception as ex:
@@ -1409,26 +1495,42 @@ class NonceCounter:
         #signed is False by default
         # mapping num_nonce to 12 bytes means the 4 most significant bytes are always 0
         return self.num_nonce.to_bytes(12, byteorder='little')
+    
+    @property
+    def padded_bytes(self):
+        #used for Android AES encryption
+        #signed is False by default
+        # mapping num_nonce to 16 bytes means the 8 most significant bytes are always 0
+        return self.num_nonce.to_bytes(16, byteorder='little')
+
+    @property
+    def useAES(self):
+        return self._useAES
+
+    @useAES.setter
+    def useAES(self, value):
+        self._useAES = value
 
 class RPiId:
     # FILERPIID = "rpiid"
 
     def __init__(self):
-        # self.rpi_id = self.readSavedId()
-        # if self.rpi_id is not None: return
-        #first try the cpu_id
-        new_id = self.getNewCpuId()
-        # then try the mac address of ethernet or wifi adapters
-        if new_id is None: new_id = self.getMacAddressNetworking()
-        #then try mac address of bluetooth
-        if new_id is None: new_id = self.getMacAdressBluetooth()
-        #if all else fail - create a random 12bytes integer
-        if new_id is None: new_id = str(int.from_bytes(random.randbytes(12), byteorder='little', signed=False))
-        #and saved the new_id for future reuse - so this does not have to run everytime
-        # self.savedId(new_id)
-        #rpi_id is the hex representation of the hash
-        #convert it to bytes for sending with bytearray.fromhex(hex_string) or bytes.fromhex(hex_string)
-        self.rpi_id = self.hashTheId(new_id)
+        self.rpi_id = self.createComplexRpiID()
+
+    def createComplexRpiID(self):
+        cpuId = self.getNewCpuId()
+        wifiId = self.getMacAddressNetworking()
+        btId = self.getMacAdressBluetooth()
+        complexId = cpuId if cpuId is not None else ""
+        complexId += wifiId if wifiId is not None else ""
+        complexId += btId if btId is not None else ""
+        if complexId == "" : 
+            mLOG.log("no identifier found for this RPi - generating random id")
+            complexId = str(int.from_bytes(random.randbytes(12), byteorder='little', signed=False))
+        # print(cpuId,wifiId,btId)
+        # print(complexId)
+        # print(self.hashTheId(complexId))
+        return self.hashTheId(complexId)
 
     def hashTheId(self,id_str):
         #return the hex representeion of the hash
@@ -1461,8 +1563,8 @@ class RPiId:
     def getAdapterAddress(self,adapter):
         try:
             with open(f"{adapter}/address", 'r', encoding="utf-8") as f:
-                found_id = f.read()
-                return None if (found_id !=  "00:00:00:00:00:00" or found_id == "") else found_id
+                found_id = f.read().rstrip('\n')
+                return None if (found_id ==  "00:00:00:00:00:00" or found_id == "") else found_id
         except Exception as e:
             return None
     
@@ -1480,12 +1582,15 @@ class RPiId:
         #shortcut - most RPi have either eth0 or wlan0 - so try these two first
         eth0 = "/sys/class/net/eth0"
         wlan0 = "/sys/class/net/wlan0"
-        if os.path.isdir(eth0):
-            found_id = self.getAdapterAddress(eth0)
-        if found_id is not None: return found_id
+        #since this was written to allow the user to set a wifi SSID and password via bluetooth
+        #in most cases we can expect the wlan0 adapter to exists - so always use that first
         if os.path.isdir(wlan0):
             found_id = self.getAdapterAddress(wlan0)
         if found_id is not None: return found_id
+        if os.path.isdir(eth0):
+            found_id = self.getAdapterAddress(eth0)
+        if found_id is not None: return found_id
+        
 
         #for differnet linux OS - name maybe different - use this to find ethernet and wifi adapters if they exists
         interfaces = [ f.path for f in os.scandir("/sys/class/net") if f.is_dir() ]
@@ -1518,6 +1623,45 @@ class RPiId:
                 return mac[0]
         
         return None
+    
+class AndroidAES:
+    @staticmethod
+    def encrypt(plaintext, key,nonce_counter):
+        # Generate a random 16-byte IV
+        iv = nonce_counter.padded_bytes
+        
+        # Create a padder
+        padder = padding.PKCS7(128).padder()
+        padded_data = padder.update(plaintext) + padder.finalize()
+        
+        # Create an encryptor
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        
+        # Encrypt the padded data
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+        # print(''.join('{:02x}'.format(x) for x in ciphertext))
+        #always return a 12 byte nonce (to match chachapoly implementation
+        return nonce_counter.bytes + ciphertext
+
+    @staticmethod
+    def decrypt(ciphertext, key):
+        # Extract the IV (first 12 bytes)
+        iv = ciphertext[:12]
+        iv += bytes.fromhex("00000000")  #cypher text arrives with 12 bytes nonce - pad it to 16
+        ciphertext = ciphertext[12:]
+        
+        # Create a decryptor
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        
+        # Decrypt the ciphertext
+        padded_data = decryptor.update(ciphertext) + decryptor.finalize()
+        
+        # Create an unpadder
+        unpadder = padding.PKCS7(128).unpadder()
+        plaintext = unpadder.update(padded_data) + unpadder.finalize()
+        return plaintext
 
 class BTCrypto:
     """
@@ -1528,6 +1672,30 @@ class BTCrypto:
         encrypt will increment counter to get the next nonce for encryption
         decrypt will record last_nonce (received) if message is decoded correctly
     note: nonce_counter is single instance maintained by BtCryptoManager - which is instantiated at start
+
+    Android vs iOS:
+    iOS was developped first using the latest encryption (Chacha20Poly1305)
+    Android: some of the older devices do not have access to ChaCha... so AES is used instead.
+    Since iOS App is already published, ChaCha... needs to be supported.
+    Since the code always react to a request from phone device, decrypt is always called first,
+        follwed by an encrypted response (Notification).
+    To support both encryption, when an encrypted message is received, both encryption are tried (iOS first):
+        - if they both fail we raise an exception (as before android)
+        - if one passes, the flag "useAES" is set accordingly.
+        note:   the flag useAES is store with nonce counter - which is instantiated only once.  
+                it cannot be sotred in BTCrypto since this class is re-instantiated everytime the encryption changes.
+        - when the encryption is then used for the response, it selects the correct encryption based on this flag.
+        - Note: the flag is set every time a decryption occur so the following encryption(s) always match.
+    This will however cause problem if two devices of different type (one iOS, one Android) connect at the same time:
+        Since notifications go to all devices registered, the device that is idle while the other request and encrypted action,
+        will received an encrypted message it cannot decrypt, and assume that it's password is stale:
+            - it will disconnect
+            - it will erase the password from the device.
+            - it will warn the user asking for the password.
+                - if user enters the password, this will be sent to the RPi, and be accepted, but the response
+                will go the the previous device, which will then see an undecryptable message and disconnect as well 
+            - users will basically block each other until one stops entering the password.
+    A notice will be provided on the blog to explain that multiple devices of diffrent types connecting at the same time is not suppported.
     """
 
     def __init__(self,pw):
@@ -1541,22 +1709,45 @@ class BTCrypto:
     
     def encryptForSending(self,message,nonce_counter):
         #none_counter of type NonceCounter
-        chacha = ChaCha20Poly1305(self.hashed_pw)
         mLOG.log(f'current nonce is: {nonce_counter.num_nonce}')
         nonce_counter.next_even()
         nonce = nonce_counter.bytes
-        ct = chacha.encrypt(nonce, message.encode(encoding = 'UTF-8', errors = 'strict'),None)
-        return nonce+ct 
+        if nonce_counter.useAES:
+            #mLOG.log(f'encrypting with AES')
+            return AndroidAES.encrypt(message.encode('utf8'),self.hashed_pw,nonce_counter)
+        else:
+            #IOS uses chachapoly
+            #mLOG.log(f'encrypting with ChaCha')
+            chacha = ChaCha20Poly1305(self.hashed_pw)
+            ct = chacha.encrypt(nonce, message.encode(encoding = 'UTF-8', errors = 'strict'),None)
+            return nonce+ct 
+        
+    def decryptAES(self,cypher,nonce_counter):
+        try:
+            nonce_bytes = cypher[0:12]
+            message = AndroidAES.decrypt(cypher,self.hashed_pw) 
+            if not nonce_counter.useAES: mLOG.log(f'AES encryption detected') # only warn if changing encryption
+            nonce_counter.useAES = True
+            if nonce_counter.checkLastReceived(nonce_bytes) :return message
+            #if nonce was stale return a blank message which will be ignored
+            return b""
+        except Exception as ex: 
+            mLOG.log(f"crypto decrypt error (AES): {ex}")
+            raise ex
 
-    def decryptFromReceived(self,cypher,nonce_counter):
+    def decryptChaCha(self,cypher,nonce_counter):
         #combined message arrives with nonce (12 bytes first)
         #this returns the encode message as utf8 encoded bytes -> so btwifi characteristic can process them as before - including SEPARATOR 
         #raise the error after printing the message - so it is caught in the calling method
+
+        #************ below is for ios chachapoly
         nonce_bytes = cypher[0:12]
         ct = bytes(cypher[12:])
         chacha = ChaCha20Poly1305(self.hashed_pw)
         try:
             message = chacha.decrypt(nonce_bytes, ct,None)
+            if nonce_counter.useAES : mLOG.log(f'ChaCha encryption detected') #only warn if changing encryption
+            nonce_counter.useAES = False
             #checkLastReceived updates the last receive dictionary if nonce is OK (ie not stale)
             if nonce_counter.checkLastReceived(nonce_bytes) : return message
             #if nonce was stale return a blank message which will be ignored
@@ -1565,8 +1756,34 @@ class BTCrypto:
             mLOG.log("crypto Invalid tag - cannot decode")
             raise invTag
         except Exception as ex: 
-            mLOG.log(f"crypto decrypt error: {ex}")
+            mLOG.log(f"crypto decrypt error(ChaCha): {ex}")
             raise ex
+        
+    def decryptFromReceived(self,cypher,nonce_counter):
+        #always try the previous known encryption most use case only have one phone connected
+        #mLOG.log(f"current decryption with  {'AES' if nonce_counter.useAES else 'ChaCha'}")
+        if nonce_counter.useAES:
+            mLOG.log("decrypting attempt with AES")
+            try:
+                encBytes = self.decryptAES(cypher,nonce_counter)
+            except Exception as ex:
+                try:
+                    mLOG.log("decrypting attempt Failed with AES - trying ChachaPoly")
+                    encBytes = self.decryptChaCha(cypher,nonce_counter)
+                except:
+                    raise ex
+        else:
+            mLOG.log("decrypting attempt with ChachaPoly")
+            try:
+                encBytes = self.decryptChaCha(cypher,nonce_counter)
+            except Exception as ex2:
+                try:
+                    mLOG.log("decrypting attempt Failed with AES - trying AES")
+                    encBytes = self.decryptAES(cypher,nonce_counter)
+                except:
+                    raise ex2
+        return encBytes
+
 
 class RequestCounter:
 
@@ -1605,14 +1822,14 @@ class BTCryptoManager:
     meant to be a singleton instantiated when code starts
     code is untested with multiple connections - but if multiple connections are allowed
     BTCryptoManager is available to all connections which implies:
-        - if RPi is locked nd requires encryption - it applies to all connection
+        - if RPi is locked and requires encryption - it applies to all connection
         - if RPi is unlocked - all connections communicate in clear until any of the connection locks the RPI
 
     when RPi receives a crypted message while unlocked, or a garbled message while locked:
         - the decrypting method will automatically call the unknown() method - to process it and decide the response
             adn stores it in the unknown_response property
-        - however it will return unknown as decrypted message so Chracteristic can process it and call the register_ssid() on its service.
-        - when the service sees this "unknown" - it can simply fetched the response for the processed cypher in the
+        - it will return unknown as decrypted message so Chracteristic can process it and call the register_ssid() on its service.
+        - when the service sees this "unknown" - it fetches the response for the processed cypher in the
             unknown_response property and send it via notification.
     """
 
@@ -1657,21 +1874,6 @@ class BTCryptoManager:
         else:
             return  nonce_bytes+rpi_id_bytes
             
-
-    # def requestLockRPi(self):
-    #     """
-    #     call this when user request to lock the RPi.
-    #     if there is no password - direct user to ssh into pi and create one using
-    #         "sudo python3 /usr/bin/btwifiset/setpassword.py password"
-    #         TODO: this is not implemented yet
-    #     returns True if password file exists and password is not empty string
-    #     returns False if password does not exists
-    #     """
-    #     if self.pi_info.locked: return True # pi is already locked - do nothing - this should not happen if IOS is managing correctly
-    #     if self.pi_info.password is not None: 
-    #         self.crypto = BTCrypto(self.pi_info.password)
-    #         self.pi_info.locked = True
-    #     return self.pi_info.password is not None
     
     def unknown(self,cypher,alreadyDecrypted = b""):
         """
@@ -1785,7 +1987,9 @@ class BTCryptoManager:
         else:
             try:
                 #if error in decrypting - it is caught below
+                #if come here because pi is already locked, self.crypto is already set, if not - need to set it:
                 if forceDecryption: self.crypto = BTCrypto(self.pi_info.password)
+                #mLOG.log( f"decryption is using password {self.pi_info.password}")
                 msg_bytes = self.crypto.decryptFromReceived(cypher,self.nonce_counter)
                 #since this could be a retry message while in garbled process, which is now OK:
                 if self.timer is not None:
@@ -1796,11 +2000,12 @@ class BTCryptoManager:
                 if  msg_bytes.decode(errors="ignore") == self.quitting_msg:
                     self.nonce_counter.removeIdentifier(cypher[0:12])
                 if forceDecryption: 
-                    #special case: user is trying to lock and has correct password
-                    #not caught by unknwn since aboved called decrypt again with forceDecryption
+                    #special case: user is trying to lock the Pi (which is unlocked) and has correct password
+                    #not exception caught on first pass (that called unkonwn) since aboved called decrypt again with forceDecryption
                     if msg_bytes == b'\x1eLockRequest':
                         mLOG.log("received LockRequest - processing ...")
-                        #can't try to decrypt same message twice - it will be stale...
+                        #can't let unknown try to decrypt the same message twice - it will be stale...
+                        # so pass the decrypted message to unknown as alreadyDecrypted
                         self.crypto = None
                         self.pi_info.locked = False
                         self.unknown(cypher,msg_bytes)
@@ -1824,6 +2029,14 @@ class BTCryptoManager:
                 """
                 return b'\x1e'+"unknown".encode()  
         
+# if __name__ == "__main__":
+#     bt = BTCryptoManager()
+#     if bt.crypto is not None:
+#         print(''.join(f'{b:02x}' for b in bt.crypto.hashed_pw))
+#     x = bt.encrypt("CheckIn")
+#     print(''.join(f'{b:02x}' for b in x))
+#     print([b for b in x])
+    
 
 
 
@@ -1831,9 +2044,6 @@ SEPARATOR_HEX = b'\x1e'
 SEPARATOR = SEPARATOR_HEX.decode()  # string representation can be concatenated or use in split function
 NOTIFY_TIMEOUT = 1000  #in ms - used for checking notifications
 BLE_SERVER_GLIB_TIMEOUT = 2500  # used for checking BLE Server timeout
-
-
-# **************************************************************************
 
 class BTDbusSender(dbus.service.Object):
     #only for BT process
@@ -2038,24 +2248,43 @@ class Blue:
 
     @staticmethod
     def set_adapter():
-        Blue.bus = dbus.SystemBus()
-        obj = Blue.bus.get_object('org.bluez','/')
-        obj_interface=dbus.Interface(obj,'org.freedesktop.DBus.ObjectManager')
-        all = obj_interface.GetManagedObjects()
-        for item in all.items(): #this gives a list of all bluez objects
-            # mLOG.log(f"BlueZ Adapter name: {item[0]}")
-            # mLOG.log(f"BlueZ Adapter data: {item[1]}\n")
-            # mLOG.log("******************************\n")
-            if  (item[0] == '/org/bluez/hci0') or ('org.bluez.LEAdvertisingManager1' in item[1].keys() and 'org.bluez.GattManager1' in item[1].keys() ):
-                #this the bluez adapter1 object that we need
-                # mLOG.log(f"Found BlueZ Adapter name: {item[0]}\n")
-                
-                Blue.adapter_name = item[0]
-                Blue.adapter_obj = Blue.bus.get_object('org.bluez',Blue.adapter_name)
-                #turn_on the adapter - to make sure (on rpi it may already be turned on)
-                props = dbus.Interface(Blue.adapter_obj,'org.freedesktop.DBus.Properties')
-                props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(1))
-                break
+        try:
+            found_flag = False
+            Blue.bus = dbus.SystemBus()
+            obj = Blue.bus.get_object('org.bluez','/')
+            obj_interface=dbus.Interface(obj,'org.freedesktop.DBus.ObjectManager')
+            all = obj_interface.GetManagedObjects()
+            for item in all.items(): #this gives a list of all bluez objects
+                # mLOG.log(f"BlueZ Adapter name: {item[0]}")
+                # mLOG.log(f"BlueZ Adapter data: {item[1]}\n")
+                # mLOG.log("******************************\n")
+                if  (item[0] == '/org/bluez/hci0') or ('org.bluez.LEAdvertisingManager1' in item[1].keys() and 'org.bluez.GattManager1' in item[1].keys() ):
+                    #this the bluez adapter1 object that we need
+                    # mLOG.log(f"Found BlueZ Adapter name: {item[0]}\n")
+                    found_flag = True
+                    Blue.adapter_name = item[0]
+                    Blue.adapter_obj = Blue.bus.get_object('org.bluez',Blue.adapter_name)
+                    #turn_on the adapter - to make sure (on rpi it may already be turned on)
+                    props = dbus.Interface(Blue.adapter_obj,'org.freedesktop.DBus.Properties')
+
+                    props.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(1))
+                    props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(0))
+                    props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
+                    props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(1))
+                    props.Set("org.bluez.Adapter1", "DiscoverableTimeout", dbus.UInt32(0))
+
+                    break
+            if not found_flag:
+                mLOG.log("No suitable Bluetooth adapter found")
+                #raise Exception("No suitable Bluetooth adapter found")
+            
+        except dbus.exceptions.DBusException as e:
+            mLOG.log(f"DBus error in set_adapter: {str(e)}")
+            raise
+        except Exception as e:
+            mLOG.log(f"Error in set_adapter: {str(e)}")
+            raise
+
 
     @staticmethod
     def adv_mgr(): 
@@ -2101,11 +2330,16 @@ class Advertise(dbus.service.Object):
 
     def __init__(self, index,bleMgr):
         self.bleMgr = bleMgr
+        self.hostname = WifiUtil.get_hostname()
         self.properties = dict()
         self.properties["Type"] = dbus.String("peripheral")
         self.properties["ServiceUUIDs"] = dbus.Array([UUID_WIFISET],signature='s')
         self.properties["IncludeTxPower"] = dbus.Boolean(True)
-        self.properties["LocalName"] = dbus.String("Wifiset")
+        self.properties["LocalName"] = dbus.String(self.hostname)
+        self.properties["Flags"] = dbus.Byte(0x06) 
+
+        #flags: 0x02: "LE General Discoverable Mode"
+        #       0x04: "BR/EDR Not Supported"
         self.path = "/org/bluez/advertise" + str(index)
         dbus.service.Object.__init__(self, Blue.bus, self.path)
         self.ad_manager = Blue.adv_mgr() 
@@ -2256,7 +2490,8 @@ class Service(dbus.service.Object):
                         'Primary': self.primary,
                         'Characteristics': dbus.Array(
                                 self.get_characteristic_paths(),
-                                signature='o')
+                                signature='o'),
+                        'Secure': dbus.Array([], signature='s')  # Empty array means no security required
                 }
         }
 
@@ -2306,7 +2541,10 @@ class Characteristic(dbus.service.Object):
                         'Flags': self.flags,
                         'Descriptors': dbus.Array(
                                 self.get_descriptor_paths(),
-                                signature='o')
+                                signature='o'),
+                        'RequireAuthentication': dbus.Boolean(False),
+                        'RequireAuthorization': dbus.Boolean(False),
+                        'RequireEncryption': dbus.Boolean(False),
                 }
         }
 
@@ -2373,6 +2611,7 @@ class Descriptor(dbus.service.Object):
                         'Characteristic': self.chrc.get_path(),
                         'UUID': self.uuid,
                         'Flags': self.flags,
+                        'Secure': dbus.Array([], signature='s') 
                 }
         }
 
@@ -2452,11 +2691,11 @@ class WifiSetService(Service):
         nc = 0
         while nc < 4:
             nc += 1
-            print("nc:",nc)
+            # print("nc:",nc)
             data = ""
             if nc>1: data = f"data is {nc*1000}"
             button_dict = {"code":f"ButtonCode{nc}", "data":data}
-            print(button_dict)
+            # print(button_dict)
             json_str = json.dumps(button_dict)
             self.sender.send_signal(json_str)
             time.sleep(.7)
@@ -2468,7 +2707,7 @@ class WifiSetService(Service):
             - commands: val[0] must be blank string. then val[1] contains the command
                 -note: command can be json string (user defined buttons)
             - connection_request: val[0] must not be blank and is the requested SSID
-                                  val[1] is the password - which can be left blank
+                                  val[1] is the password - which can be left blank (or = NONE if open SSID)
         Notifications to ios are one of three 
             (all notifications will be pre-pended by SEPARATOR in notification callback "info_wifi_callback"  below as means 
              to differentiate notification from AP info read by ios)
@@ -2518,6 +2757,11 @@ class WifiSetService(Service):
                 # ap_connected = self.mgr.wpa.connected_AP
                 # if ap_connected != "0000":
                 #     self.notifications.setNotification(ap_connected)
+            elif val[1].startswith("DEL-"):
+                # ssid comes after the first four characters
+                ssid_to_delete = val[1][4:]
+                self.mgr.request_deletion(ssid_to_delete)
+                self.notifications.setNotification('DELETED',"wifi")
                 
             
             #*********** LOCK Management:
@@ -2528,7 +2772,7 @@ class WifiSetService(Service):
                 else:
                     mLOG.log(f"RPi is unlocked - sending in clear: {self.cryptomgr.unknown_response}")
                 #simulate response did not get there:
-                #return
+                # return
                 self.notifications.setNotification(self.cryptomgr.unknown_response,"crypto")
             elif val[1] == "UnlockRequest":
                 #notification: - must send response encrypted and then afterwards disable crypto
@@ -2702,7 +2946,7 @@ class WifiDataCharacteristic(Characteristic):
             therefore after msg is sent whit encryption, only then is crypto disabled on the pi.
         '''
         if self.notifying:
-            if len(self.service.notifications.notifications)>0:
+            while len(self.service.notifications.notifications)>0:
                 thisNotification_bytes = self.service.notifications.notifications.pop(0)
                 #notification is in bytes, already has prefix separator and may be encrypted
                 needToUnlock = thisNotification_bytes == self.service.notifications.unlockingMsg
@@ -2712,7 +2956,8 @@ class WifiDataCharacteristic(Characteristic):
                 self.PropertiesChanged("org.bluez.GattCharacteristic1", {"Value": value}, [])
                 mLOG.log('notification sent')
                 if needToUnlock:
-                    self.service.cryptomgr.disableCrypto() 
+                    self.service.cryptomgr.disableCrypto()
+                    break 
                 
         return self.notifying
 
@@ -2750,7 +2995,7 @@ class WifiDataCharacteristic(Characteristic):
         messages are either:
              - SEP + command (for controling wifi on pi or asking for AP list)
              - ssid only (no SEP)
-             - ssid + SEP  (no paswword) : note: I dont think this occurs anymore
+             - ssid + SEP + NONE : indicates an open network that does not need a password
              - ssid + SEP + password + SEP + code    code = CP: call change_password; =AD: call add_network
         returns [first_string,second_string]
         everything that arrives before SEP goes into first_string
@@ -2774,7 +3019,7 @@ class WifiDataCharacteristic(Characteristic):
         #         received[index]+=str(val)
         #case where only ssid has arrived (no password because known network)
         if len(received) == 1 :
-            received.append("")
+            received.append("") #ensure at least two elements in received
         mLOG.log(f'from iphone received SSID/PW: {received}')
         ConfigData.reset_timeout()  # any data received from iphone resets the BLE Server timeout
         self.service.register_SSID(received)
@@ -2823,6 +3068,7 @@ class BLEManager:
             mLOG.log(ex)
         self.mainloop.quit()
 
+
     def graceful_quit(self,signum,frame):
         mLOG.log("stopping main loop on SIGTERM received")
         self.quitBT()
@@ -2855,7 +3101,7 @@ class BLEManager:
 
     def start(self):
         mLOG.log("** Starting BTwifiSet - version 2 (nmcli/crypto)")
-        mLOG.log("** Version date: June 20 2024 **\n")
+        mLOG.log("** Version date: March 10 2025 **\n")
         mLOG.log(f'BTwifiSet timeout: {int(ConfigData.TIMEOUT/60)} minutes')
         mLOG.log("starting BLE Server")
         ConfigData.reset_timeout()
